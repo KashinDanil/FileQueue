@@ -85,7 +85,7 @@ if ($message !== null) {
 $queue->isEmpty(); // bool
 $queue->size();    // int — counts remaining (unconsumed) messages
 
-// Compact the queue file
+// Cleanup
 $queue->compact();
 ```
 
@@ -93,7 +93,7 @@ $queue->compact();
 
 Over time the data file grows as messages are appended and consumed. `compact()` rewrites the file to contain only unread messages, reclaiming disk space. 
 
-No need to call it regularly if your `FileQueueWorker` runs all the time. When the last message is dequeued, all associated files are removed automatically, so no manual cleanup is needed.
+No need to call it regularly if your `FileQueueWorker` runs continuously and the queues are emptied regularly. When the last message is dequeued, all associated files are removed immediately, so no manual cleanup is needed.
 
 ## How it works
 

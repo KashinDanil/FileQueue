@@ -66,8 +66,7 @@ final class FileQueueTest extends TestCase
     public function testFilesRemovedAfterFullDrain(): void
     {
         $this->queue->enqueue(new QueueMessage(['v' => 1]));
-        $this->queue->dequeue(); // consumes last message — files still present
-        $this->queue->dequeue(); // returns null → triggers deleteAllFiles()
+        $this->queue->dequeue(); // consumes last message → triggers deleteAllFiles() immediately
 
         $this->assertFileDoesNotExist($this->dir . '/test.queue.data');
         $this->assertFileDoesNotExist($this->dir . '/test.queue.pointer');

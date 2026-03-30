@@ -51,7 +51,7 @@ class FileQueue implements QueueInterface
         $this->lock->acquire();
         try {
             $record = $this->storage->shift();
-            if (null === $record) {
+            if (null === $record || !$this->storage->hasNext()) {
                 $this->deleteAllFiles();
             }
 
