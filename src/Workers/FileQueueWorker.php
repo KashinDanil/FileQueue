@@ -9,9 +9,11 @@ use DanilKashin\FileQueue\Queue\QueueInterface;
 
 abstract class FileQueueWorker extends QueueWorker
 {
-    public function __construct(private readonly string $queuesDir)
-    {
-        parent::__construct();
+    public function __construct(
+        private readonly string $queuesDir,
+        ?int $maxTicks = null,
+    ) {
+        parent::__construct($maxTicks);
     }
 
     /**
