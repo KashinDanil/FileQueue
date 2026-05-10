@@ -19,7 +19,7 @@ composer require danil-kashin/file-queue
 
 Extend `FileQueueWorker` and implement `processMessage()`. Return `true` on success, `false` on failure. Failed messages are dequeued and not retried automatically.
 
-The worker scans a directory for queue files and processes each discovered queue on every tick, up to **10 messages per queue**. This ensures equal resource distribution across queues and avoids the noisy-neighbor problem. It handles `SIGTERM`/`SIGINT` for graceful shutdown.
+The worker scans a directory for queue files and processes **one message per tick**, rotating across discovered queues. Each queue may contribute up to **10 messages per cycle** (a full pass over all queues) before the worker moves on, which ensures equal resource distribution across queues and avoids the noisy-neighbor problem. The worker handles `SIGTERM`/`SIGINT` for graceful shutdown.
 
 ```php
 use DanilKashin\FileQueue\Queue\QueueMessage;
@@ -35,6 +35,29 @@ class OrderWorker extends FileQueueWorker
 ```
 
 For each processed message the worker prints `+` (success) or `-` (failure) to stdout.
+
+#### Tuning
+
+- Override `getMessagesPerQueueLimit()` to change the per-queue per-cycle limit (default: 10).
+- Pass `maxTicks` as the second constructor argument to stop the worker after a fixed number of ticks — useful for tests, supervised one-shot runs, or external schedulers that prefer to recycle the process periodically.
+
+```php
+class OrderWorker extends FileQueueWorker
+{
+    protected function getMessagesPerQueueLimit(): int
+    {
+        return 50;
+    }
+
+    protected function processMessage(QueueMessage $message): bool
+    {
+        return handleOrder($message->payload);
+    }
+}
+
+$worker = new OrderWorker(queuesDir: '/var/queues', maxTicks: 1000);
+$worker->run();
+```
 
 ### 2. Run the worker
 

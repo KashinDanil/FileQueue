@@ -11,146 +11,171 @@ use PHPUnit\Framework\TestCase;
 
 final class QueueWorkerTest extends TestCase
 {
-    /**
-     * Returns a concrete QueueWorker with configurable processMessage() and shouldStop().
-     * Exposes callTick() to drive tick() directly from tests.
-     *
-     * @param array $queues
-     * @param callable $processMessage
-     * @param callable|null $shouldStop defaults to always returning false
-     *
-     * @return QueueWorker
-     */
     private function makeWorker(
         array $queues,
         callable $processMessage,
-        ?callable $shouldStop = null,
+        ?int $perQueueLimit = null,
     ): QueueWorker {
-        $shouldStop ??= static fn(): bool => false;
-
-        return new class($queues, $processMessage, $shouldStop) extends QueueWorker {
+        return new class($queues, $processMessage, $perQueueLimit) extends QueueWorker {
             public function __construct(
                 private readonly array $queues,
                 private readonly mixed $processFn,
-                private readonly mixed $shouldStopFn,
+                private readonly ?int $perQueueLimit,
             ) {
                 parent::__construct();
             }
 
             protected function getQueues(): array { return $this->queues; }
             protected function processMessage(QueueMessage $message): bool { return ($this->processFn)($message); }
-            protected function shouldStop(): bool { return ($this->shouldStopFn)(); }
+            protected function getMessagesPerQueueLimit(): int
+            {
+                return $this->perQueueLimit ?? parent::getMessagesPerQueueLimit();
+            }
             public function callTick(): void { $this->tick(); }
         };
     }
 
-    public function testProcessMessageIsCalledForEachMessage(): void
-    {
-        $queue = $this->createMock(QueueInterface::class);
-        $queue->method('isEmpty')->willReturnOnConsecutiveCalls(false, false, false, true);
-        $queue->method('dequeue')->willReturn(new QueueMessage(['v' => 1]));
-
-        $callCount = 0;
-
-        $this->makeWorker([$queue], function () use (&$callCount): bool {
-            $callCount++;
-            return true;
-        })->callTick();
-
-        $this->assertSame(3, $callCount);
-    }
-
-    public function testBatchLimitStopsAfterTenSuccessfulMessages(): void
+    public function testTickProcessesExactlyOneMessage(): void
     {
         $queue = $this->createMock(QueueInterface::class);
         $queue->method('isEmpty')->willReturn(false);
-        $queue->expects($this->exactly(10))->method('dequeue')
-            ->willReturn(new QueueMessage(['v' => 1]));
-
-        $this->makeWorker([$queue], static fn(): bool => true)->callTick();
-    }
-
-    public function testFailedMessageIsStillDequeued(): void
-    {
-        $queue = $this->createMock(QueueInterface::class);
-        $queue->method('isEmpty')->willReturnOnConsecutiveCalls(false, true);
         $queue->expects($this->once())->method('dequeue')
             ->willReturn(new QueueMessage(['v' => 1]));
 
-        $this->makeWorker([$queue], static fn(): bool => false)->callTick();
-    }
-
-    public function testFailedMessageDoesNotCountTowardBatchLimit(): void
-    {
-        // First 5 messages fail, next 10 succeed → 15 total dequeues before batch limit kicks in
         $callCount = 0;
-
-        $queue = $this->createMock(QueueInterface::class);
-        $queue->method('isEmpty')->willReturn(false);
-        $queue->expects($this->exactly(15))->method('dequeue')
-            ->willReturn(new QueueMessage(['v' => 1]));
 
         $this->makeWorker([$queue], function () use (&$callCount): bool {
-            return ++$callCount > 5;
-        })->callTick();
-    }
-
-    public function testAllQueuesAreProcessedInOneTick(): void
-    {
-        $makeQueue = function (int $messageCount): QueueInterface {
-            $isEmpty = array_merge(array_fill(0, $messageCount, false), [true]);
-            $queue   = $this->createMock(QueueInterface::class);
-            $queue->method('isEmpty')->willReturnOnConsecutiveCalls(...$isEmpty);
-            $queue->method('dequeue')->willReturn(new QueueMessage(['v' => 1]));
-
-            return $queue;
-        };
-
-        $callCount = 0;
-
-        $this->makeWorker([$makeQueue(2), $makeQueue(3)], function () use (&$callCount): bool {
             $callCount++;
             return true;
         })->callTick();
 
-        $this->assertSame(5, $callCount);
+        $this->assertSame(1, $callCount);
     }
 
-    public function testStopSignalBreaksOutOfProcessingLoop(): void
+    public function testWorkerStaysOnQueueUntilLimitThenAdvances(): void
     {
-        $processCount = 0;
+        $busy = $this->createMock(QueueInterface::class);
+        $busy->method('isEmpty')->willReturn(false);
+        $busy->method('dequeue')->willReturn(new QueueMessage(['q' => 'busy']));
 
+        $other = $this->createMock(QueueInterface::class);
+        $other->method('isEmpty')->willReturn(false);
+        $other->method('dequeue')->willReturn(new QueueMessage(['q' => 'other']));
+
+        $seen = [];
+        $worker = $this->makeWorker(
+            [$busy, $other],
+            function (QueueMessage $m) use (&$seen): bool {
+                $seen[] = $m->payload['q'];
+                return true;
+            },
+            perQueueLimit: 3,
+        );
+
+        for ($i = 0; $i < 7; $i++) {
+            $worker->callTick();
+        }
+
+        // 3 from busy (limit hit), 3 from other (limit hit), generator ends,
+        // a new pass starts: 1 more from busy.
+        $this->assertSame(['busy', 'busy', 'busy', 'other', 'other', 'other', 'busy'], $seen);
+    }
+
+    public function testFailedMessageDoesNotCountTowardLimit(): void
+    {
         $queue = $this->createMock(QueueInterface::class);
         $queue->method('isEmpty')->willReturn(false);
         $queue->method('dequeue')->willReturn(new QueueMessage(['v' => 1]));
 
-        $this->makeWorker(
+        $callCount = 0;
+        $worker = $this->makeWorker(
             [$queue],
-            function () use (&$processCount): bool {
-                $processCount++;
-                return true;
+            // First 5 fail, then everything succeeds.
+            function () use (&$callCount): bool {
+                return ++$callCount > 5;
             },
-            function () use (&$processCount): bool {
-                return $processCount >= 3;
-            },
-        )->callTick();
+            perQueueLimit: 3,
+        );
 
-        $this->assertSame(3, $processCount);
+        // 5 failed + 3 successful = 8 dequeues before the limit is reached.
+        for ($i = 0; $i < 8; $i++) {
+            $worker->callTick();
+        }
+
+        $this->assertSame(8, $callCount);
     }
 
-    public function testDequeueReturningNullBreaksInnerLoop(): void
+    public function testEmptyQueueIsSkippedToNextQueue(): void
     {
-        $queue = $this->createMock(QueueInterface::class);
-        $queue->method('isEmpty')->willReturn(false);
-        $queue->method('dequeue')->willReturn(null);
+        $first = $this->createMock(QueueInterface::class);
+        $first->method('isEmpty')->willReturn(true);
+        $first->expects($this->never())->method('dequeue');
 
-        $wasCalled = false;
+        $second = $this->createMock(QueueInterface::class);
+        $second->method('isEmpty')->willReturn(false);
+        $second->expects($this->once())->method('dequeue')
+            ->willReturn(new QueueMessage(['v' => 2]));
 
-        $this->makeWorker([$queue], function () use (&$wasCalled): bool {
-            $wasCalled = true;
+        $callCount = 0;
+
+        $this->makeWorker([$first, $second], function () use (&$callCount): bool {
+            $callCount++;
             return true;
         })->callTick();
 
-        $this->assertFalse($wasCalled);
+        $this->assertSame(1, $callCount);
+    }
+
+    public function testNullDequeueAdvancesToNextQueue(): void
+    {
+        $first = $this->createMock(QueueInterface::class);
+        $first->method('isEmpty')->willReturn(false);
+        $first->method('dequeue')->willReturn(null);
+
+        $second = $this->createMock(QueueInterface::class);
+        $second->method('isEmpty')->willReturn(false);
+        $second->expects($this->once())->method('dequeue')
+            ->willReturn(new QueueMessage(['v' => 2]));
+
+        $callCount = 0;
+
+        $this->makeWorker([$first, $second], function () use (&$callCount): bool {
+            $callCount++;
+            return true;
+        })->callTick();
+
+        $this->assertSame(1, $callCount);
+    }
+
+    public function testTickIsNoOpWhenAllQueuesEmpty(): void
+    {
+        $first = $this->createMock(QueueInterface::class);
+        $first->method('isEmpty')->willReturn(true);
+        $first->expects($this->never())->method('dequeue');
+
+        $second = $this->createMock(QueueInterface::class);
+        $second->method('isEmpty')->willReturn(true);
+        $second->expects($this->never())->method('dequeue');
+
+        $callCount = 0;
+
+        $this->makeWorker([$first, $second], function () use (&$callCount): bool {
+            $callCount++;
+            return true;
+        })->callTick();
+
+        $this->assertSame(0, $callCount);
+    }
+
+    public function testNoQueuesIsNoOp(): void
+    {
+        $callCount = 0;
+
+        $this->makeWorker([], function () use (&$callCount): bool {
+            $callCount++;
+            return true;
+        })->callTick();
+
+        $this->assertSame(0, $callCount);
     }
 }
